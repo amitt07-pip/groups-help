@@ -7,7 +7,7 @@ Telegram control bot that drives several userbot accounts (Telethon). On `/post`
 ```bash
 cd /root && git clone https://github.com/amitt07-pip/groups-help && cd groups-help
 python3 -m venv venv && venv/bin/pip install -r requirements.txt
-cp .env.example .env   # fill BOT_TOKEN, API_ID, API_HASH, ADMIN_IDS, GROUP_OWNER_ID
+cp .env.example .env   # fill BOT_TOKEN, API_ID, API_HASH, ADMIN_IDS
 cp groupshelp.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now groupshelp
 journalctl -u groupshelp -f
 ```
@@ -18,7 +18,7 @@ Make the bot **admin in the control chat** (so it sees replies and can delete lo
 
 1. `/addaccount` – reply with phone → code (with spaces, `1 2 3 4 5`) → 2FA password if set. The bot deletes the code/password messages.
 2. `/addad` – reply with the ad text (formatting kept).
-3. Add the bot as admin to the target group, then `/addgroup <chat id>` in the control chat. Only groups owned by `GROUP_OWNER_ID` are accepted (the owner doesn't get bot commands unless also in `ADMIN_IDS`). Accounts that aren't members join via the bot's invite link.
+3. Add the bot as admin to the target group, then `/addgroup <chat id>` in the control chat. The bot must be admin there; it detects the group owner itself and shows it in `/groups` (the owner gets no bot commands unless in `ADMIN_IDS`). Accounts that aren't members join via the bot's invite link.
 4. `/post` – tap the group button (topic groups then show General + each open topic); progress is shown live.
 
 Also: `/accounts`, `/delaccount <id>`, `/ads`, `/delad <id>`, `/groups`, `/delgroup <id>`, `/cancel`.

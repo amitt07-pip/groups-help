@@ -31,7 +31,6 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
-GROUP_OWNER_ID = int(os.environ["GROUP_OWNER_ID"])
 CONTROL_CHAT_ID = int(os.getenv("CONTROL_CHAT_ID", "-1004407796718"))
 GAP_SECONDS = int(os.getenv("GAP_SECONDS", "60"))
 MAX_FLOOD_WAIT = 300
@@ -63,7 +62,7 @@ HELP = (
     "/addad – save the next text message as an ad\n"
     "/ads – list ads\n"
     "/delad &lt;id&gt; – delete an ad\n\n"
-    "/addgroup &lt;chat id&gt; – add a group owned by GROUP_OWNER_ID (bot must be admin there)\n"
+    "/addgroup &lt;chat id&gt; – add a group (bot must be admin there)\n"
     "/groups – list groups\n"
     "/delgroup &lt;id&gt; – remove a group\n\n"
     "/post – pick a group; every logged-in account sends one ad, {gap}s apart\n"
@@ -318,27 +317,28 @@ async def cmd_addgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         chat = await bot.get_chat(chat_ref)
-        member = await bot.get_chat_member(chat.id, GROUP_OWNER_ID)
+        admins = await bot.get_chat_administrators(chat.id)
     except Exception as e:
-        await update.effective_message.reply_text(f"Can't read that group (is the bot in it?): {e}")
+        await update.effective_message.reply_text(f"Can't read that group (is the bot admin in it?): {e}")
         return
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await update.effective_message.reply_text("That's not a group.")
         return
-    if member.status != ChatMemberStatus.OWNER:
-        await update.effective_message.reply_text(f"Not added: {GROUP_OWNER_ID} is not the owner of that group.")
+    if not any(a.user.id == bot.id for a in admins):
+        await update.effective_message.reply_text("Make the bot an admin in that group first.")
         return
+    owner = next((a.user for a in admins if a.status == ChatMemberStatus.OWNER), None)
     link = f"https://t.me/{chat.username}" if chat.username else chat.invite_link
     if not link:
         try:
             link = await bot.export_chat_invite_link(chat.id)
         except Exception:
             link = None
-    g = db.save_group(chat.id, chat.title, link)
-    note = "" if link else "\nNo invite link (make the bot admin with invite rights) – accounts must already be members."
-    await update.effective_message.reply_text(
-        f"Group #{g['id']} saved: {chat.title}{note}"
-    )
+    owner_name = (owner.full_name + (f" (@{owner.username})" if owner.username else "")) if owner else None
+    g = db.save_group(chat.id, chat.title, link, owner.id if owner else None, owner_name)
+    note = "" if link else "\nNo invite link (give the bot invite rights) – accounts must already be members."
+    owner_text = f"{owner_name} ({owner.id})" if owner else "not found"
+    await update.effective_message.reply_text(f"Group #{g['id']} saved: {chat.title}\nOwner: {owner_text}{note}")
 
 
 @admin_only
@@ -348,7 +348,11 @@ async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not groups:
         await update.message.reply_text("No groups. Use /addgroup <chat id>.")
         return
-    lines = [f"#{g['id']} {html.escape(g['title'] or '')} (<code>{g['chat_id']}</code>)" for g in groups]
+    lines = [
+        f"#{g['id']} {html.escape(g['title'] or '')} (<code>{g['chat_id']}</code>)\n"
+        f"   owner: {html.escape(g['owner_name'] or '?')} (<code>{g['owner_id'] or '?'}</code>)"
+        for g in groups
+    ]
     await update.message.reply_text("<b>Groups</b>\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
@@ -774,7 +778,7 @@ async def post_init(app: Application):
         except Exception:
             log.exception("account #%s failed to connect", acc["id"])
         await client.disconnect()
-    log.info("control_chat=%s group_owner=%s admins=%s gap=%ss accounts_online=%s", CONTROL_CHAT_ID, GROUP_OWNER_ID, sorted(ADMIN_IDS), GAP_SECONDS, len(clients))
+    log.info("control_chat=%s admins=%s gap=%ss accounts_online=%s", CONTROL_CHAT_ID, sorted(ADMIN_IDS), GAP_SECONDS, len(clients))
 
 
 async def post_shutdown(app: Application):

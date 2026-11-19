@@ -32,6 +32,11 @@ _conn.executescript(
     """
 )
 _conn.commit()
+_group_cols = {r["name"] for r in _conn.execute("PRAGMA table_info(groups)")}
+for _col, _type in (("owner_id", "INTEGER"), ("owner_name", "TEXT")):
+    if _col not in _group_cols:
+        _conn.execute(f"ALTER TABLE groups ADD COLUMN {_col} {_type}")
+_conn.commit()
 try:
     os.chmod(DB_PATH, 0o600)
 except OSError:
@@ -95,11 +100,12 @@ def delete_ad(ad_id):
 
 
 # groups
-def save_group(chat_id, title, link):
+def save_group(chat_id, title, link, owner_id=None, owner_name=None):
     _run(
-        "INSERT INTO groups (chat_id, title, link, added_at) VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, link=COALESCE(excluded.link, groups.link)",
-        (chat_id, title, link, int(time.time())),
+        "INSERT INTO groups (chat_id, title, link, owner_id, owner_name, added_at) VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, link=COALESCE(excluded.link, groups.link), "
+        "owner_id=excluded.owner_id, owner_name=excluded.owner_name",
+        (chat_id, title, link, owner_id, owner_name, int(time.time())),
     )
     return _one("SELECT * FROM groups WHERE chat_id=?", (chat_id,))
 
