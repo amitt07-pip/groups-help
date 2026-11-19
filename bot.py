@@ -499,6 +499,9 @@ async def cb_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 @control_only
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reply_to = update.message.reply_to_message
+    if not reply_to or not reply_to.from_user or reply_to.from_user.id != context.bot.id:
+        return
     state = pending.get(update.effective_user.id)
     if not state:
         return
