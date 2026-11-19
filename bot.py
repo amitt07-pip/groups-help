@@ -7,7 +7,7 @@ import re
 import time
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus, ChatType, ParseMode
 from telegram.ext import (
     Application,
@@ -30,6 +30,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+CONTROL_CHAT_ID = int(os.getenv("CONTROL_CHAT_ID", "-1004407796718"))
 GAP_SECONDS = int(os.getenv("GAP_SECONDS", "60"))
 MAX_FLOOD_WAIT = 300
 
@@ -57,10 +58,10 @@ HELP = (
     "/addad – save the next text message as an ad\n"
     "/ads – list ads\n"
     "/delad &lt;id&gt; – delete an ad\n\n"
-    "/addgroup – send inside your group (or /addgroup @username in DM)\n"
+    "/addgroup &lt;chat id&gt; – add a group you own (bot must be admin there)\n"
     "/groups – list groups\n"
     "/delgroup &lt;id&gt; – remove a group\n\n"
-    "/post [group id] – every logged-in account sends one ad, {gap}s apart\n"
+    "/post – pick a group; every logged-in account sends one ad, {gap}s apart\n"
     "/cancel – cancel the current step"
 )
 
@@ -78,9 +79,9 @@ def admin_only(func):
     return wrapper
 
 
-def private_only(func):
+def control_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.type != ChatType.PRIVATE:
+        if not update.effective_chat or update.effective_chat.id != CONTROL_CHAT_ID:
             return
         return await func(update, context)
 
@@ -89,6 +90,12 @@ def private_only(func):
 
 def new_client(session: str = "") -> TelegramClient:
     return TelegramClient(StringSession(session), API_ID, API_HASH)
+
+
+async def ask(update: Update, text: str):
+    await update.effective_chat.send_message(
+        text, parse_mode=ParseMode.HTML, reply_markup=ForceReply(selective=False)
+    )
 
 
 async def drop_pending(user_id: int):
@@ -103,13 +110,13 @@ async def drop_pending(user_id: int):
 # ---------- start / help ----------
 
 @admin_only
-@private_only
+@control_only
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP.format(gap=GAP_SECONDS), parse_mode=ParseMode.HTML)
 
 
 @admin_only
-@private_only
+@control_only
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     had = update.effective_user.id in pending
     await drop_pending(update.effective_user.id)
@@ -119,11 +126,11 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- accounts ----------
 
 @admin_only
-@private_only
+@control_only
 async def cmd_addaccount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await drop_pending(update.effective_user.id)
     pending[update.effective_user.id] = {"step": "phone"}
-    await update.message.reply_text("Send the phone number with country code, e.g. +919876543210\n/cancel to stop.")
+    await ask(update, "Reply with the phone number with country code, e.g. +919876543210\n/cancel to stop.")
 
 
 async def login_phone(update: Update, state: dict, text: str):
@@ -145,29 +152,33 @@ async def login_phone(update: Update, state: dict, text: str):
         await update.message.reply_text(f"Telegram says wait {e.seconds}s before requesting another code.")
         return
     state.update(step="code", client=client, phone=phone, hash=sent.phone_code_hash)
-    await update.message.reply_text(
+    await ask(
+        update,
         "Code sent to that account's Telegram app.\n"
-        "Send it <b>with spaces</b>, e.g. <code>1 2 3 4 5</code> "
-        "(Telegram cancels codes that are forwarded as-is).",
-        parse_mode=ParseMode.HTML,
+        "Reply with it <b>with spaces</b>, e.g. <code>1 2 3 4 5</code> "
+        "(Telegram cancels codes that are forwarded as-is). I'll delete your message.",
     )
 
 
 async def login_code(update: Update, state: dict, text: str):
     code = re.sub(r"\D", "", text)
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
     client: TelegramClient = state["client"]
     try:
         await client.sign_in(phone=state["phone"], code=code, phone_code_hash=state["hash"])
     except errors.SessionPasswordNeededError:
         state["step"] = "password"
-        await update.message.reply_text("This account has 2FA. Send its password (I'll delete your message).")
+        await ask(update, "This account has 2FA. Reply with its password (I'll delete your message).")
         return
     except errors.PhoneCodeInvalidError:
-        await update.message.reply_text("Wrong code. Send it again or /cancel.")
+        await ask(update, "Wrong code. Reply with it again or /cancel.")
         return
     except errors.PhoneCodeExpiredError:
         await drop_pending(update.effective_user.id)
-        await update.message.reply_text("Code expired. Run /addaccount again.")
+        await update.effective_chat.send_message("Code expired. Run /addaccount again.")
         return
     await finish_login(update, state)
 
@@ -181,7 +192,7 @@ async def login_password(update: Update, state: dict, text: str):
     try:
         await client.sign_in(password=text)
     except errors.PasswordHashInvalidError:
-        await update.effective_chat.send_message("Wrong 2FA password. Send it again or /cancel.")
+        await ask(update, "Wrong 2FA password. Reply with it again or /cancel.")
         return
     await finish_login(update, state)
 
@@ -203,7 +214,7 @@ async def finish_login(update: Update, state: dict):
 
 
 @admin_only
-@private_only
+@control_only
 async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     accs = db.list_accounts()
     if not accs:
@@ -217,7 +228,7 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
-@private_only
+@control_only
 async def cmd_delaccount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or not context.args[0].lstrip("#").isdigit():
         await update.message.reply_text("Usage: /delaccount <id> (see /accounts)")
@@ -240,15 +251,15 @@ async def cmd_delaccount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- ads ----------
 
 @admin_only
-@private_only
+@control_only
 async def cmd_addad(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await drop_pending(update.effective_user.id)
     pending[update.effective_user.id] = {"step": "ad"}
-    await update.message.reply_text("Send the ad text (formatting is kept). /cancel to stop.")
+    await ask(update, "Reply with the ad text (formatting is kept). /cancel to stop.")
 
 
 @admin_only
-@private_only
+@control_only
 async def cmd_ads(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ads = db.list_ads()
     if not ads:
@@ -262,7 +273,7 @@ async def cmd_ads(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
-@private_only
+@control_only
 async def cmd_delad(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or not context.args[0].lstrip("#").isdigit():
         await update.message.reply_text("Usage: /delad <id> (see /ads)")
@@ -286,19 +297,19 @@ def parse_group_ref(ref: str):
 
 
 @admin_only
+@control_only
 async def cmd_addgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = context.bot
-    in_group = update.effective_chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
-    if in_group:
-        chat_ref = update.effective_chat.id
-    else:
-        chat_ref = parse_group_ref(context.args[0]) if context.args else None
-        if chat_ref is None:
-            await update.message.reply_text(
-                "Send /addgroup inside the group, or /addgroup @username / -100id here.\n"
-                "The bot must be a member of the group."
-            )
-            return
+    chat_ref = parse_group_ref(context.args[0]) if context.args else None
+    if chat_ref is None:
+        await update.message.reply_text(
+            "Usage: /addgroup <chat id>, e.g. /addgroup -1001234567890\n"
+            "Add the bot to that group as admin first."
+        )
+        return
+    if chat_ref == CONTROL_CHAT_ID:
+        await update.message.reply_text("That's this control chat.")
+        return
     try:
         chat = await bot.get_chat(chat_ref)
         member = await bot.get_chat_member(chat.id, update.effective_user.id)
@@ -325,18 +336,18 @@ async def cmd_addgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
-@private_only
+@control_only
 async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     groups = db.list_groups()
     if not groups:
-        await update.message.reply_text("No groups. Send /addgroup inside your group.")
+        await update.message.reply_text("No groups. Use /addgroup <chat id>.")
         return
     lines = [f"#{g['id']} {html.escape(g['title'] or '')} (<code>{g['chat_id']}</code>)" for g in groups]
     await update.message.reply_text("<b>Groups</b>\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 @admin_only
-@private_only
+@control_only
 async def cmd_delgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or not context.args[0].lstrip("#").isdigit():
         await update.message.reply_text("Usage: /delgroup <id> (see /groups)")
@@ -459,22 +470,11 @@ async def start_round(update: Update, context: ContextTypes.DEFAULT_TYPE, group:
 
 
 @admin_only
-@private_only
+@control_only
 async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     groups = db.list_groups()
     if not groups:
-        await update.message.reply_text("No groups. Send /addgroup inside your group.")
-        return
-    if context.args:
-        gid = context.args[0].lstrip("#")
-        group = db.get_group(int(gid)) if gid.isdigit() else None
-        if not group:
-            await update.message.reply_text("No such group (see /groups).")
-            return
-        await start_round(update, context, group)
-        return
-    if len(groups) == 1:
-        await start_round(update, context, groups[0])
+        await update.message.reply_text("No groups. Use /addgroup <chat id>.")
         return
     kb = [[InlineKeyboardButton(g["title"] or str(g["chat_id"]), callback_data=f"post:{g['id']}")] for g in groups]
     await update.message.reply_text("Post to which group?", reply_markup=InlineKeyboardMarkup(kb))
@@ -482,7 +482,7 @@ async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cb_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not is_admin(update):
+    if not is_admin(update) or update.effective_chat.id != CONTROL_CHAT_ID:
         await q.answer()
         return
     group = db.get_group(int(q.data.split(":", 1)[1]))
@@ -497,7 +497,7 @@ async def cb_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- text input router ----------
 
 @admin_only
-@private_only
+@control_only
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = pending.get(update.effective_user.id)
     if not state:
@@ -537,7 +537,7 @@ async def post_init(app: Application):
         except Exception:
             log.exception("account #%s failed to connect", acc["id"])
         await client.disconnect()
-    log.info("admins=%s gap=%ss accounts_online=%s", sorted(ADMIN_IDS), GAP_SECONDS, len(clients))
+    log.info("control_chat=%s admins=%s gap=%ss accounts_online=%s", CONTROL_CHAT_ID, sorted(ADMIN_IDS), GAP_SECONDS, len(clients))
 
 
 async def post_shutdown(app: Application):

@@ -12,12 +12,14 @@ cp groupshelp.service /etc/systemd/system/ && systemctl daemon-reload && systemc
 journalctl -u groupshelp -f
 ```
 
-## Use (bot DM, admins only, silent for everyone else)
+## Use (only in the control chat `CONTROL_CHAT_ID`, admins only, silent everywhere else)
 
-1. `/addaccount` – phone → code (send it with spaces, `1 2 3 4 5`) → 2FA password if set.
-2. `/addad` – send the ad text (formatting kept).
-3. Add the bot to your group, then send `/addgroup` inside it. Only groups where you are the owner are accepted. Make the bot admin so it can create an invite link; accounts that aren't members join with it.
-4. `/post` – pick the group; progress is shown live.
+Make the bot **admin in the control chat** (so it sees replies and can delete login codes/passwords).
+
+1. `/addaccount` – reply with phone → code (with spaces, `1 2 3 4 5`) → 2FA password if set. The bot deletes the code/password messages.
+2. `/addad` – reply with the ad text (formatting kept).
+3. Add the bot as admin to the target group, then `/addgroup <chat id>` in the control chat. Only groups you own are accepted. Accounts that aren't members join via the bot's invite link.
+4. `/post` – tap the group button; progress is shown live.
 
 Also: `/accounts`, `/delaccount <id>`, `/ads`, `/delad <id>`, `/groups`, `/delgroup <id>`, `/cancel`.
 
