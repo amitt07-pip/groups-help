@@ -1,0 +1,14 @@
+[Unit]
+Description=groups-help ad userbot controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/groups-help
+ExecStart=/root/groups-help/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
