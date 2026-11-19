@@ -30,6 +30,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+GROUP_OWNER_ID = int(os.environ["GROUP_OWNER_ID"])
 CONTROL_CHAT_ID = int(os.getenv("CONTROL_CHAT_ID", "-1004407796718"))
 GAP_SECONDS = int(os.getenv("GAP_SECONDS", "60"))
 MAX_FLOOD_WAIT = 300
@@ -60,7 +61,7 @@ HELP = (
     "/addad – save the next text message as an ad\n"
     "/ads – list ads\n"
     "/delad &lt;id&gt; – delete an ad\n\n"
-    "/addgroup &lt;chat id&gt; – add a group you own (bot must be admin there)\n"
+    "/addgroup &lt;chat id&gt; – add a group owned by GROUP_OWNER_ID (bot must be admin there)\n"
     "/groups – list groups\n"
     "/delgroup &lt;id&gt; – remove a group\n\n"
     "/post – pick a group; every logged-in account sends one ad, {gap}s apart\n"
@@ -314,7 +315,7 @@ async def cmd_addgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         chat = await bot.get_chat(chat_ref)
-        member = await bot.get_chat_member(chat.id, update.effective_user.id)
+        member = await bot.get_chat_member(chat.id, GROUP_OWNER_ID)
     except Exception as e:
         await update.effective_message.reply_text(f"Can't read that group (is the bot in it?): {e}")
         return
@@ -322,7 +323,7 @@ async def cmd_addgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("That's not a group.")
         return
     if member.status != ChatMemberStatus.OWNER:
-        await update.effective_message.reply_text("Only groups you own can be added.")
+        await update.effective_message.reply_text(f"Not added: {GROUP_OWNER_ID} is not the owner of that group.")
         return
     link = f"https://t.me/{chat.username}" if chat.username else chat.invite_link
     if not link:
@@ -591,7 +592,7 @@ async def post_init(app: Application):
         except Exception:
             log.exception("account #%s failed to connect", acc["id"])
         await client.disconnect()
-    log.info("control_chat=%s admins=%s gap=%ss accounts_online=%s", CONTROL_CHAT_ID, sorted(ADMIN_IDS), GAP_SECONDS, len(clients))
+    log.info("control_chat=%s group_owner=%s admins=%s gap=%ss accounts_online=%s", CONTROL_CHAT_ID, GROUP_OWNER_ID, sorted(ADMIN_IDS), GAP_SECONDS, len(clients))
 
 
 async def post_shutdown(app: Application):
