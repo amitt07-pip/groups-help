@@ -5,7 +5,7 @@ from decimal import Decimal
 import httpx
 
 PAY_ADDRESS = os.getenv("PAY_ADDRESS", "0x0bdd444a792c8C8880B74C9c5124770BFf8674eA")
-PRICE = Decimal(os.getenv("PRICE", "5"))
+PRICE = Decimal(os.getenv("PRICE", "1"))
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 NETWORKS = {
