@@ -23,6 +23,7 @@ from telethon.tl.functions.channels import GetForumTopicsRequest, JoinChannelReq
 from telethon.tl.functions.messages import ImportChatInviteRequest
 
 import db
+import payments
 
 load_dotenv()
 
@@ -43,7 +44,8 @@ log = logging.getLogger("groupshelp")
 clients: dict[int, TelegramClient] = {}
 pending: dict[int, dict] = {}
 topic_titles: dict[tuple[int, int], str] = {}
-round_lock = asyncio.Lock()
+round_running = False
+checking: set[int] = set()
 
 DEAD_SESSION_ERRORS = (
     errors.AuthKeyUnregisteredError,
@@ -65,6 +67,7 @@ HELP = (
     "/groups – list groups\n"
     "/delgroup &lt;id&gt; – remove a group\n\n"
     "/post – pick a group; every logged-in account sends one ad, {gap}s apart\n"
+    "/premium on|off – let other users buy one /post round\n"
     "/cancel – cancel the current step"
 )
 
@@ -419,8 +422,8 @@ async def run_round(app: Application, chat_id: int, group: dict, topic: tuple[in
     accounts = [a for a in db.list_accounts(active_only=True) if a["id"] in clients]
     ads = db.list_ads()
     if not accounts or not ads:
-        await app.bot.send_message(chat_id, "Need at least one online account (/accounts) and one ad (/ads).")
-        return
+        await app.bot.send_message(chat_id, "No online accounts or no ads right now, nothing was posted.")
+        return 0
 
     pool: list[dict] = []
     lines = [f"Posting to <b>{html.escape(group['title'] or str(group['chat_id']))}</b> – "
@@ -475,53 +478,227 @@ async def run_round(app: Application, chat_id: int, group: dict, topic: tuple[in
 
     lines.append(f"\nDone: {sent}/{len(accounts)} sent.")
     await update_status()
+    return sent
 
 
-async def start_round(update: Update, context: ContextTypes.DEFAULT_TYPE, group: dict, topic=None):
-    if round_lock.locked():
-        await update.effective_chat.send_message("A round is already running. Wait for it to finish.")
+async def start_round(update: Update, context: ContextTypes.DEFAULT_TYPE, group: dict, topic=None, paid_by=None):
+    global round_running
+    if round_running:
+        await update.effective_chat.send_message("A round is already running. Wait for it to finish and try again.")
         return
+    if paid_by and not db.use_credit(paid_by):
+        await update.effective_chat.send_message("You have no paid round left. Use /post to pay.")
+        return
+    round_running = True
+    chat_id = update.effective_chat.id
 
     async def job():
-        async with round_lock:
-            try:
-                await run_round(context.application, update.effective_chat.id, group, topic)
-            except Exception:
-                log.exception("round failed")
-                await context.bot.send_message(update.effective_chat.id, "Round crashed, check logs.")
+        global round_running
+        sent = 0
+        try:
+            sent = await run_round(context.application, chat_id, group, topic)
+        except Exception:
+            log.exception("round failed")
+            await context.bot.send_message(chat_id, "Round crashed, check logs.")
+        finally:
+            round_running = False
+            if paid_by and not sent:
+                db.add_credit(paid_by)
+                await context.bot.send_message(chat_id, "Nothing was posted, your paid round is kept. Try /post again later.")
 
     context.application.create_task(job())
 
 
-@admin_only
-@control_only
-async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def groups_keyboard(uid: int, groups: list[dict]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(g["title"] or str(g["chat_id"]), callback_data=f"post:{uid}:{g['id']}")] for g in groups]
+    )
+
+
+async def show_groups(chat, uid: int):
     groups = db.list_groups()
     if not groups:
-        await update.message.reply_text("No groups. Use /addgroup <chat id>.")
+        await chat.send_message("No groups available right now.")
         return
-    kb = [[InlineKeyboardButton(g["title"] or str(g["chat_id"]), callback_data=f"post:{g['id']}")] for g in groups]
-    await update.message.reply_text("Post to which group?", reply_markup=InlineKeyboardMarkup(kb))
+    await chat.send_message("Post to which group?", reply_markup=groups_keyboard(uid, groups))
+
+
+def premium_on() -> bool:
+    return db.get_setting("premium", "off") == "on"
+
+
+@control_only
+async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if is_admin(update) or (premium_on() and db.get_credits(uid) > 0):
+        await show_groups(update.effective_chat, uid)
+        return
+    if not premium_on():
+        return
+    online = len([a for a in db.list_accounts(active_only=True) if a["id"] in clients])
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Agree", callback_data=f"pay:agree:{uid}"),
+        InlineKeyboardButton("Cancel", callback_data=f"pay:cancel:{uid}"),
+    ]])
+    await update.message.reply_text(
+        f"Posting is <b>paid</b>: {payments.PRICE} USDT for one round.\n"
+        f"In one round each of our {online} account(s) posts one ad in the group you choose, "
+        f"{GAP_SECONDS}s apart.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+
+@admin_only
+@control_only
+async def cmd_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    arg = (context.args[0].lower() if context.args else "")
+    if arg in ("on", "off"):
+        db.set_setting("premium", arg)
+    await update.message.reply_text(f"Premium (paid /post for other users) is <b>{db.get_setting('premium', 'off')}</b>.\n"
+                                    "Usage: /premium on | /premium off", parse_mode=ParseMode.HTML)
+
+
+def payment_page(pid: int) -> tuple[str, InlineKeyboardMarkup]:
+    p = db.get_payment(pid)
+    net = payments.NETWORKS[p["network"]]
+    text = (
+        "<b>Payment</b>\n"
+        f"Network: <b>{net['name']}</b>\n"
+        f"Token: <b>{p['token']}</b>\n"
+        f"Amount: <b>{payments.PRICE} {p['token']}</b>\n"
+        f"Address: <code>{payments.PAY_ADDRESS}</code>\n\n"
+        "Send the exact amount on this network, then tap <b>Payment done</b>."
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Payment done", callback_data=f"pay:done:{p['user_id']}:{pid}"),
+        InlineKeyboardButton("Cancel", callback_data=f"pay:cancel:{p['user_id']}:{pid}"),
+    ]])
+    return text, kb
+
+
+async def cb_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    parts = q.data.split(":")
+    action, uid = parts[1], int(parts[2])
+    if update.effective_chat.id != CONTROL_CHAT_ID or q.from_user.id != uid:
+        await q.answer()
+        return
+    await q.answer()
+
+    if action == "cancel":
+        if len(parts) > 3:
+            db.cancel_payment(int(parts[3]))
+        if pending.get(uid, {}).get("step") == "txhash":
+            pending.pop(uid, None)
+        await q.edit_message_text("Payment cancelled.")
+        return
+    if not premium_on():
+        await q.edit_message_text("Paid posting is off right now.")
+        return
+
+    if action == "agree":
+        kb = [[InlineKeyboardButton(n["name"], callback_data=f"pay:net:{uid}:{key}")] for key, n in payments.NETWORKS.items()]
+        kb.append([InlineKeyboardButton("Cancel", callback_data=f"pay:cancel:{uid}")])
+        await q.edit_message_text("Choose the network:", reply_markup=InlineKeyboardMarkup(kb))
+    elif action == "net":
+        net = parts[3]
+        kb = [[InlineKeyboardButton(t, callback_data=f"pay:tok:{uid}:{net}:{t}") for t in payments.NETWORKS[net]["tokens"]]]
+        kb.append([InlineKeyboardButton("Cancel", callback_data=f"pay:cancel:{uid}")])
+        await q.edit_message_text(f"Network: {payments.NETWORKS[net]['name']}\nChoose the token:",
+                                  reply_markup=InlineKeyboardMarkup(kb))
+    elif action == "tok":
+        net, token = parts[3], parts[4]
+        try:
+            start_block = await payments.block_number(net)
+        except Exception as e:
+            log.exception("block number failed")
+            await q.edit_message_text(f"Couldn't reach the {payments.NETWORKS[net]['name']} network, try again later.")
+            return
+        pid = db.create_payment(uid, net, token, start_block - 20)
+        text, kb = payment_page(pid)
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    elif action == "done":
+        pid = int(parts[3])
+        p = db.get_payment(pid)
+        if not p or p["status"] != "pending":
+            await q.edit_message_text("This payment request is closed. Use /post again.")
+            return
+        await drop_pending(uid)
+        pending[uid] = {"step": "txhash", "pid": pid}
+        name = html.escape(q.from_user.first_name or "User")
+        await ask(update, f'<a href="tg://user?id={uid}">{name}</a>, reply to this message with your '
+                          "<b>transaction hash</b> (starts with 0x).")
+
+
+async def handle_txhash(update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict, text: str):
+    uid = update.effective_user.id
+    tx = text.strip().lower()
+    if not re.fullmatch(r"0x[0-9a-f]{64}", tx):
+        await ask(update, "That isn't a transaction hash. Reply with the hash (0x + 64 characters).")
+        return
+    pid = state["pid"]
+    if pid in checking:
+        return
+    p = db.get_payment(pid)
+    if not p or p["status"] != "pending":
+        pending.pop(uid, None)
+        await update.message.reply_text("This payment request is closed. Use /post again.")
+        return
+    if db.tx_used(tx):
+        await ask(update, "That transaction was already used. Reply with a different hash.")
+        return
+    checking.add(pid)
+    wait_msg = await update.message.reply_text("Please wait while the payment is being checked.")
+    try:
+        ok, reason = await payments.verify_tx(p["network"], p["token"], tx, p["start_block"])
+    except Exception:
+        log.exception("verify failed")
+        ok, reason = False, "Couldn't reach the blockchain right now. Reply with the hash again in a minute."
+    finally:
+        checking.discard(pid)
+    if not ok:
+        await wait_msg.edit_text(reason)
+        await ask(update, "Reply to this message with the correct transaction hash, or tap Cancel on the payment message.")
+        return
+    if not db.mark_paid(pid, tx):
+        await wait_msg.edit_text("That transaction was already used.")
+        return
+    pending.pop(uid, None)
+    db.add_credit(uid)
+    log.info("payment %s paid by %s tx %s", pid, uid, tx)
+    await wait_msg.edit_text(
+        f"Payment confirmed: {payments.NETWORKS[p['network']]['explorer']}{tx}\nYou have 1 round. Choose the group:",
+        disable_web_page_preview=True,
+    )
+    await show_groups(update.effective_chat, uid)
 
 
 async def cb_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not is_admin(update) or update.effective_chat.id != CONTROL_CHAT_ID:
+    parts = q.data.split(":")
+    uid = int(parts[1])
+    admin = is_admin(update)
+    if update.effective_chat.id != CONTROL_CHAT_ID or q.from_user.id != uid:
         await q.answer()
         return
-    parts = q.data.split(":")
-    group = db.get_group(int(parts[1]))
+    if not admin and db.get_credits(uid) <= 0:
+        await q.answer()
+        await q.edit_message_text("You have no paid round left. Use /post to pay.")
+        return
+    paid_by = None if admin else uid
+    group = db.get_group(int(parts[2]))
     await q.answer()
     if not group:
         await q.edit_message_text("Group no longer exists.")
         return
     title = group["title"] or str(group["chat_id"])
 
-    if len(parts) == 3:
-        topic_id = int(parts[2])
+    if len(parts) == 4:
+        topic_id = int(parts[3])
         topic_title = topic_titles.get((group["id"], topic_id), "General" if topic_id == GENERAL_TOPIC_ID else str(topic_id))
         await q.edit_message_text(f"Starting round for {title} → {topic_title}…")
-        await start_round(update, context, group, (topic_id, topic_title))
+        await start_round(update, context, group, (topic_id, topic_title), paid_by)
         return
 
     try:
@@ -530,25 +707,25 @@ async def cb_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_forum = False
     if not is_forum:
         await q.edit_message_text(f"Starting round for {title}…")
-        await start_round(update, context, group)
+        await start_round(update, context, group, None, paid_by)
         return
 
     try:
         topics = await fetch_topics(group)
     except Exception as e:
-        await q.edit_message_text(f"Couldn't load topics for {title}: {e}")
+        log.exception("topics failed")
+        await q.edit_message_text(f"Couldn't load topics for {title}. Try again later.")
         return
     topic_titles[(group["id"], GENERAL_TOPIC_ID)] = "General"
     for tid, ttitle in topics:
         topic_titles[(group["id"], tid)] = ttitle
-    kb = [[InlineKeyboardButton("General", callback_data=f"post:{group['id']}:{GENERAL_TOPIC_ID}")]]
-    kb += [[InlineKeyboardButton(t, callback_data=f"post:{group['id']}:{tid}")] for tid, t in topics]
+    kb = [[InlineKeyboardButton("General", callback_data=f"post:{uid}:{group['id']}:{GENERAL_TOPIC_ID}")]]
+    kb += [[InlineKeyboardButton(t, callback_data=f"post:{uid}:{group['id']}:{tid}")] for tid, t in topics]
     await q.edit_message_text(f"{title} – post in which topic?", reply_markup=InlineKeyboardMarkup(kb))
 
 
 # ---------- text input router ----------
 
-@admin_only
 @control_only
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_to = update.message.reply_to_message
@@ -559,6 +736,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text
     step = state["step"]
+    if step == "txhash":
+        await handle_txhash(update, context, state, text)
+        return
+    if not is_admin(update):
+        return
     try:
         if step == "phone":
             await login_phone(update, state, text)
@@ -624,7 +806,9 @@ def main():
     app.add_handler(CommandHandler("groups", cmd_groups))
     app.add_handler(CommandHandler("delgroup", cmd_delgroup))
     app.add_handler(CommandHandler("post", cmd_post))
-    app.add_handler(CallbackQueryHandler(cb_post, pattern=r"^post:\d+(:\d+)?$"))
+    app.add_handler(CommandHandler("premium", cmd_premium))
+    app.add_handler(CallbackQueryHandler(cb_post, pattern=r"^post:\d+:\d+(:\d+)?$"))
+    app.add_handler(CallbackQueryHandler(cb_pay, pattern=r"^pay:[a-z]+:\d+(:[A-Za-z0-9]+)*$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

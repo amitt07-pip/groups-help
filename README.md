@@ -23,6 +23,10 @@ Make the bot **admin in the control chat** (so it sees replies and can delete lo
 
 Also: `/accounts`, `/delaccount <id>`, `/ads`, `/delad <id>`, `/groups`, `/delgroup <id>`, `/cancel`.
 
+## Paid rounds (`/premium on|off`)
+
+With premium on, any user in the control chat can `/post`: paid notice → Agree → network (BEP20 / Polygon / ERC20) → token (USDT / USDC) → address + **Payment done** → reply with the tx hash → the bot checks the receipt on-chain (≥ `PRICE` to `PAY_ADDRESS`, sent after the request, hash not used before) → group/topic buttons for one round. If nothing gets posted the round is kept for later. Buttons only work for the user they were sent to.
+
 ## Keeping accounts healthy
 
 - Use real, aged accounts with 2FA; log each in once and keep the session.

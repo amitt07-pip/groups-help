@@ -114,3 +114,87 @@ def get_group(group_id):
 
 def delete_group(group_id):
     return _run("DELETE FROM groups WHERE id=?", (group_id,)).rowcount
+
+
+_conn.executescript(
+    """
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    );
+    CREATE TABLE IF NOT EXISTS payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        network TEXT NOT NULL,
+        token TEXT NOT NULL,
+        start_block INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        tx_hash TEXT UNIQUE,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS credits (
+        user_id INTEGER PRIMARY KEY,
+        rounds INTEGER NOT NULL DEFAULT 0
+    );
+    """
+)
+_conn.commit()
+
+
+# settings
+def get_setting(key, default=None):
+    r = _one("SELECT value FROM settings WHERE key=?", (key,))
+    return r["value"] if r else default
+
+
+def set_setting(key, value):
+    _run("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+
+# payments
+def create_payment(user_id, network, token, start_block):
+    return _run(
+        "INSERT INTO payments (user_id, network, token, start_block, created_at) VALUES (?, ?, ?, ?, ?)",
+        (user_id, network, token, start_block, int(time.time())),
+    ).lastrowid
+
+
+def get_payment(pid):
+    return _one("SELECT * FROM payments WHERE id=?", (pid,))
+
+
+def tx_used(tx_hash):
+    return _one("SELECT id FROM payments WHERE tx_hash=?", (tx_hash.lower(),)) is not None
+
+
+def mark_paid(pid, tx_hash):
+    """Returns False if the tx hash was already claimed."""
+    try:
+        cur = _run(
+            "UPDATE payments SET status='paid', tx_hash=? WHERE id=? AND status='pending'",
+            (tx_hash.lower(), pid),
+        )
+    except sqlite3.IntegrityError:
+        return False
+    return cur.rowcount == 1
+
+
+def cancel_payment(pid):
+    _run("UPDATE payments SET status='cancelled' WHERE id=? AND status='pending'", (pid,))
+
+
+# credits (paid rounds)
+def get_credits(user_id):
+    r = _one("SELECT rounds FROM credits WHERE user_id=?", (user_id,))
+    return r["rounds"] if r else 0
+
+
+def add_credit(user_id, n=1):
+    _run(
+        "INSERT INTO credits (user_id, rounds) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET rounds=rounds+excluded.rounds",
+        (user_id, n),
+    )
+
+
+def use_credit(user_id):
+    return _run("UPDATE credits SET rounds=rounds-1 WHERE user_id=? AND rounds>0", (user_id,)).rowcount == 1
