@@ -19,7 +19,7 @@ from telegram.ext import (
 )
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.channels import GetForumTopicsRequest, JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 
 import db
@@ -33,6 +33,7 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split("
 CONTROL_CHAT_ID = int(os.getenv("CONTROL_CHAT_ID", "-1004407796718"))
 GAP_SECONDS = int(os.getenv("GAP_SECONDS", "60"))
 MAX_FLOOD_WAIT = 300
+GENERAL_TOPIC_ID = 1
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -40,6 +41,7 @@ log = logging.getLogger("groupshelp")
 
 clients: dict[int, TelegramClient] = {}
 pending: dict[int, dict] = {}
+topic_titles: dict[tuple[int, int], str] = {}
 round_lock = asyncio.Lock()
 
 DEAD_SESSION_ERRORS = (
@@ -383,17 +385,36 @@ async def resolve_group(client: TelegramClient, group: dict):
     return await client.get_input_entity(group["chat_id"])
 
 
-async def send_ad(client: TelegramClient, peer, text: str):
+async def send_ad(client: TelegramClient, peer, text: str, topic_id: int | None = None):
+    reply_to = topic_id if topic_id and topic_id != GENERAL_TOPIC_ID else None
     try:
-        await client.send_message(peer, text, parse_mode="html")
+        await client.send_message(peer, text, parse_mode="html", reply_to=reply_to)
     except (errors.FloodWaitError, errors.SlowModeWaitError) as e:
         if e.seconds > MAX_FLOOD_WAIT:
             raise
         await asyncio.sleep(e.seconds + 1)
-        await client.send_message(peer, text, parse_mode="html")
+        await client.send_message(peer, text, parse_mode="html", reply_to=reply_to)
 
 
-async def run_round(app: Application, chat_id: int, group: dict):
+async def fetch_topics(group: dict) -> list[tuple[int, str]]:
+    last_error = None
+    for acc_id, client in list(clients.items()):
+        try:
+            peer = await resolve_group(client, group)
+            res = await client(GetForumTopicsRequest(peer, offset_date=None, offset_id=0, offset_topic=0, limit=100))
+            return [
+                (t.id, t.title)
+                for t in res.topics
+                if getattr(t, "title", None) and t.id != GENERAL_TOPIC_ID and not getattr(t, "closed", False)
+            ]
+        except DEAD_SESSION_ERRORS:
+            continue
+        except Exception as e:
+            last_error = e
+    raise RuntimeError(f"no account could read the topics ({last_error})")
+
+
+async def run_round(app: Application, chat_id: int, group: dict, topic: tuple[int, str] | None = None):
     accounts = [a for a in db.list_accounts(active_only=True) if a["id"] in clients]
     ads = db.list_ads()
     if not accounts or not ads:
@@ -403,6 +424,8 @@ async def run_round(app: Application, chat_id: int, group: dict):
     pool: list[dict] = []
     lines = [f"Posting to <b>{html.escape(group['title'] or str(group['chat_id']))}</b> – "
              f"{len(accounts)} account(s), {GAP_SECONDS}s gap"]
+    if topic:
+        lines[0] += f"\nTopic: <b>{html.escape(topic[1])}</b>"
     status = await app.bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def update_status():
@@ -430,7 +453,7 @@ async def run_round(app: Application, chat_id: int, group: dict):
                 await update_status()
                 await asyncio.sleep(wait)
                 lines.pop()
-            await send_ad(client, peer, ad["text"])
+            await send_ad(client, peer, ad["text"], topic[0] if topic else None)
             last_sent = time.monotonic()
             sent += 1
             lines.append(f"{label}: sent ad #{ad['id']}")
@@ -453,7 +476,7 @@ async def run_round(app: Application, chat_id: int, group: dict):
     await update_status()
 
 
-async def start_round(update: Update, context: ContextTypes.DEFAULT_TYPE, group: dict):
+async def start_round(update: Update, context: ContextTypes.DEFAULT_TYPE, group: dict, topic=None):
     if round_lock.locked():
         await update.effective_chat.send_message("A round is already running. Wait for it to finish.")
         return
@@ -461,7 +484,7 @@ async def start_round(update: Update, context: ContextTypes.DEFAULT_TYPE, group:
     async def job():
         async with round_lock:
             try:
-                await run_round(context.application, update.effective_chat.id, group)
+                await run_round(context.application, update.effective_chat.id, group, topic)
             except Exception:
                 log.exception("round failed")
                 await context.bot.send_message(update.effective_chat.id, "Round crashed, check logs.")
@@ -485,13 +508,41 @@ async def cb_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update) or update.effective_chat.id != CONTROL_CHAT_ID:
         await q.answer()
         return
-    group = db.get_group(int(q.data.split(":", 1)[1]))
+    parts = q.data.split(":")
+    group = db.get_group(int(parts[1]))
     await q.answer()
     if not group:
         await q.edit_message_text("Group no longer exists.")
         return
-    await q.edit_message_text(f"Starting round for {group['title']}…")
-    await start_round(update, context, group)
+    title = group["title"] or str(group["chat_id"])
+
+    if len(parts) == 3:
+        topic_id = int(parts[2])
+        topic_title = topic_titles.get((group["id"], topic_id), "General" if topic_id == GENERAL_TOPIC_ID else str(topic_id))
+        await q.edit_message_text(f"Starting round for {title} → {topic_title}…")
+        await start_round(update, context, group, (topic_id, topic_title))
+        return
+
+    try:
+        is_forum = bool((await context.bot.get_chat(group["chat_id"])).is_forum)
+    except Exception:
+        is_forum = False
+    if not is_forum:
+        await q.edit_message_text(f"Starting round for {title}…")
+        await start_round(update, context, group)
+        return
+
+    try:
+        topics = await fetch_topics(group)
+    except Exception as e:
+        await q.edit_message_text(f"Couldn't load topics for {title}: {e}")
+        return
+    topic_titles[(group["id"], GENERAL_TOPIC_ID)] = "General"
+    for tid, ttitle in topics:
+        topic_titles[(group["id"], tid)] = ttitle
+    kb = [[InlineKeyboardButton("General", callback_data=f"post:{group['id']}:{GENERAL_TOPIC_ID}")]]
+    kb += [[InlineKeyboardButton(t, callback_data=f"post:{group['id']}:{tid}")] for tid, t in topics]
+    await q.edit_message_text(f"{title} – post in which topic?", reply_markup=InlineKeyboardMarkup(kb))
 
 
 # ---------- text input router ----------
@@ -572,7 +623,7 @@ def main():
     app.add_handler(CommandHandler("groups", cmd_groups))
     app.add_handler(CommandHandler("delgroup", cmd_delgroup))
     app.add_handler(CommandHandler("post", cmd_post))
-    app.add_handler(CallbackQueryHandler(cb_post, pattern=r"^post:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_post, pattern=r"^post:\d+(:\d+)?$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

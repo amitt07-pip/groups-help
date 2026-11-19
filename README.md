@@ -19,7 +19,7 @@ Make the bot **admin in the control chat** (so it sees replies and can delete lo
 1. `/addaccount` – reply with phone → code (with spaces, `1 2 3 4 5`) → 2FA password if set. The bot deletes the code/password messages.
 2. `/addad` – reply with the ad text (formatting kept).
 3. Add the bot as admin to the target group, then `/addgroup <chat id>` in the control chat. Only groups you own are accepted. Accounts that aren't members join via the bot's invite link.
-4. `/post` – tap the group button; progress is shown live.
+4. `/post` – tap the group button (topic groups then show General + each open topic); progress is shown live.
 
 Also: `/accounts`, `/delaccount <id>`, `/ads`, `/delad <id>`, `/groups`, `/delgroup <id>`, `/cancel`.
 
