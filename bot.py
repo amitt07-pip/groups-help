@@ -337,14 +337,10 @@ async def cmd_addgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             link = None
     owner_name = (owner.full_name + (f" (@{owner.username})" if owner.username else "")) if owner else None
     g = db.save_group(chat.id, chat.title, link, owner.id if owner else None, owner_name)
-    note = "" if link else "\nNo invite link (give the bot invite rights) – accounts must already be members."
-    if not getattr(me, "is_anonymous", False):
-        note += ("\nThe bot is not anonymous there. Bots can't switch this on themselves – the owner must edit the "
-                 "bot's admin rights and turn on \"Remain anonymous\" so members don't see it, then run /addgroup again.")
-    else:
-        note += "\nThe bot is anonymous there."
     owner_text = f"{owner_name} ({owner.id})" if owner else "not found"
-    await update.effective_message.reply_text(f"Group #{g['id']} saved: {chat.title}\nOwner: {owner_text}{note}")
+    status = await update.effective_message.reply_text(f"Group #{g['id']} saved: {chat.title}\nOwner: {owner_text}")
+    note = await leave_group(bot, g, bool(chat.username))
+    await status.edit_text(status.text + note)
 
 
 @admin_only
@@ -410,11 +406,15 @@ async def send_ad(client: TelegramClient, peer, text: str, topic_id: int | None 
         await client.send_message(peer, text, parse_mode="html", reply_to=reply_to)
 
 
-async def fetch_topics(group: dict) -> list[tuple[int, str]]:
+async def fetch_topics(group: dict) -> list[tuple[int, str]] | None:
+    """Topics of a forum group via the userbots; None if the group has no topics."""
     last_error = None
     for acc_id, client in list(clients.items()):
         try:
             peer = await resolve_group(client, group)
+            entity = await client.get_entity(peer)
+            if not getattr(entity, "forum", False):
+                return None
             res = await client(GetForumTopicsRequest(peer, offset_date=None, offset_id=0, offset_topic=0, limit=100))
             return [
                 (t.id, t.title)
@@ -712,19 +712,14 @@ async def cb_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        is_forum = bool((await context.bot.get_chat(group["chat_id"])).is_forum)
+        topics = await fetch_topics(group)
     except Exception:
-        is_forum = False
-    if not is_forum:
+        log.exception("topics failed")
+        await q.edit_message_text(f"Couldn't reach {title} with any account. Try again later.")
+        return
+    if topics is None:
         await q.edit_message_text(f"Starting round for {title}…")
         await start_round(update, context, group, None, paid_by)
-        return
-
-    try:
-        topics = await fetch_topics(group)
-    except Exception as e:
-        log.exception("topics failed")
-        await q.edit_message_text(f"Couldn't load topics for {title}. Try again later.")
         return
     topic_titles[(group["id"], GENERAL_TOPIC_ID)] = "General"
     for tid, ttitle in topics:
@@ -770,6 +765,40 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- lifecycle ----------
 
+async def leave_group(bot, g: dict, public: bool) -> str:
+    note = ""
+    if not public:
+        # private group: the bot's invite link may stop working once it leaves, so join the accounts first
+        joined = 0
+        for acc_id, client in list(clients.items()):
+            try:
+                await resolve_group(client, g)
+                joined += 1
+            except Exception as e:
+                log.warning("account #%s couldn't join %s: %s", acc_id, g["chat_id"], e)
+            await asyncio.sleep(3)
+        note += f"\nPrivate group: {joined}/{len(clients)} online account(s) are in it. Accounts added later must join it themselves."
+    try:
+        await bot.leave_chat(g["chat_id"])
+        note += "\nThe bot left the group."
+    except Exception as e:
+        note += f"\nCouldn't leave the group: {e}"
+    return note
+
+
+async def leave_saved_groups(app: Application):
+    for g in db.list_groups():
+        try:
+            member = await app.bot.get_chat_member(g["chat_id"], app.bot.id)
+            if member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+                continue
+            chat = await app.bot.get_chat(g["chat_id"])
+        except Exception:
+            continue
+        note = await leave_group(app.bot, g, bool(chat.username))
+        log.info("group %s (%s):%s", g["chat_id"], g["title"], note.replace("\n", " "))
+
+
 async def post_init(app: Application):
     for acc in db.list_accounts(active_only=True):
         client = new_client(acc["session"])
@@ -785,6 +814,7 @@ async def post_init(app: Application):
             log.exception("account #%s failed to connect", acc["id"])
         await client.disconnect()
     log.info("control_chat=%s admins=%s gap=%ss accounts_online=%s", CONTROL_CHAT_ID, sorted(ADMIN_IDS), GAP_SECONDS, len(clients))
+    asyncio.create_task(leave_saved_groups(app))
 
 
 async def post_shutdown(app: Application):
