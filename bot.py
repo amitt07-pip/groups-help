@@ -324,7 +324,8 @@ async def cmd_addgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await update.effective_message.reply_text("That's not a group.")
         return
-    if not any(a.user.id == bot.id for a in admins):
+    me = next((a for a in admins if a.user.id == bot.id), None)
+    if not me:
         await update.effective_message.reply_text("Make the bot an admin in that group first.")
         return
     owner = next((a.user for a in admins if a.status == ChatMemberStatus.OWNER), None)
@@ -337,6 +338,11 @@ async def cmd_addgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner_name = (owner.full_name + (f" (@{owner.username})" if owner.username else "")) if owner else None
     g = db.save_group(chat.id, chat.title, link, owner.id if owner else None, owner_name)
     note = "" if link else "\nNo invite link (give the bot invite rights) – accounts must already be members."
+    if not getattr(me, "is_anonymous", False):
+        note += ("\nThe bot is not anonymous there. Bots can't switch this on themselves – the owner must edit the "
+                 "bot's admin rights and turn on \"Remain anonymous\" so members don't see it, then run /addgroup again.")
+    else:
+        note += "\nThe bot is anonymous there."
     owner_text = f"{owner_name} ({owner.id})" if owner else "not found"
     await update.effective_message.reply_text(f"Group #{g['id']} saved: {chat.title}\nOwner: {owner_text}{note}")
 
